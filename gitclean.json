@@ -1,0 +1,24 @@
+{
+    "hello-world-repo":
+    {
+        "repository": "hello-world-repo",
+        "org": "company-org",
+        "squadChannel": "squad-cicd",
+        "daysForPrWarn": "7",
+        "daysForPrClose": "14",
+        "daysForBotBranchDelete": "14",
+        "daysForBranchWarn": "90",
+        "branchWarnLevel": "@biweekly"
+    },
+	"script-repo":
+    {
+        "repository": "script-repo",
+        "org": "company-org",
+        "squadChannel": "SquadAlpha",
+        "daysForPrWarn": "7",
+        "daysForPrClose": "14",
+        "daysForBotBranchDelete": "0",
+        "daysForBranchWarn": "90",
+        "branchWarnLevel": "@monthly"
+    }
+}
