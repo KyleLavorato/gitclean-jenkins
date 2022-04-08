@@ -1,11 +1,9 @@
-@Library('SharedLibrary') _
-
 import java.text.SimpleDateFormat
 
 properties([
     parameters([
         stringParam(name: 'REPOSITORY', defaultValue: '', description: 'Repository to run the cleanup in'),
-        stringParam(name: 'ORG', defaultValue: 'deep-security', description: 'Organization that the repository belongs to'),
+        stringParam(name: 'ORG', defaultValue: '', description: 'Organization that the repository belongs to'),
         stringParam(name: 'SQUAD_CHANNEL', defaultValue: '', description: 'Name of the slack channel for the team the repository belongs to (Do not include the `#`)'),
         stringParam(name: 'DAYS_FOR_PR_WARN', defaultValue: '7', description: 'Age in days until a PR triggers a warning'),
         stringParam(name: 'DAYS_FOR_PR_CLOSE', defaultValue: '14', description: 'Age in days until a PR is closed'),
@@ -14,6 +12,187 @@ properties([
         stringParam(name: 'BRANCH_WARN_LEVEL', defaultValue: '@daily', description: "How often to send out the stale branch warnings. Must be one of: '@daily', '@weekly', '@biweekly', '@monthly'")
     ])
 ])
+
+//////////////////////////
+// Supporting functions //
+//////////////////////////
+
+def GET_RAW(String method, String url, boolean null404) {
+    def response
+    retryWithBackoff([
+        retryCount: 6,
+        backoffTime: 20,
+        resetCount: 3
+    ]) {
+        response = httpRequest([
+            authentication: token(),
+            url: urlAPI()+url,
+            validResponseCodes: '100:600',
+        ])
+        def code = response.getStatus()
+        if (404 == code && null404) {
+            response = null
+            return
+        }
+        if (400 <= code) {
+            def side = 'client'
+            if (500 <= code) {
+                side = 'server'
+            }
+            def errorArg = [
+                type: "dsgithub.${side}.get${method}",
+                message: """
+                dsgithub.get${method}: HTTP ${response}
+                Response: ${response.content}\nRequest: GET ${url}
+                """.stripIndent().trim(),
+            ]
+            // 5XX are internal server errors, we'll assume we can sleep and retry.
+            // 429 is "Too Many Requests" which is meant to be a retry.
+            if (code >= 500 || code == 429) {
+                error(errorArg)
+            } else {
+                // Other 4XX errors indicate a bad request that should not be retried.
+                retryWithBackoff.errorNoRetry(errorArg)
+            }
+        }
+    }
+    return response
+}
+
+def GET(String method, String url, boolean null404) {
+    def response = GET_RAW(method, url, null404)
+    if (response == null) {
+        return null
+    }
+    def json = new JsonSlurperClassic().parseText(response.content)
+    return json
+}
+
+def GET(String method, String url) {
+    return GET(method, url, false)
+}
+
+def POST(String method, String url, Map map) {
+    def body = JsonOutput.toJson(map)
+    def response
+    retryWithBackoff([
+        retryCount: 6,
+        backoffTime: 20,
+        resetCount: 3
+    ]) {
+        response = httpRequest([
+            acceptType: 'APPLICATION_JSON',
+            contentType: 'APPLICATION_JSON',
+            authentication: token(),
+            httpMode: 'POST',
+            url: urlAPI()+url,
+            requestBody: body,
+            validResponseCodes: '100:600',
+        ])
+        def code = response.getStatus()
+        if (400 <= code) {
+            def side = 'client'
+            if (500 <= code) {
+                side = 'server'
+            }
+            def errorArg = [
+                type: "dsgithub.${side}.post${method}",
+                message: """
+                dsgithub.post${method}: HTTP ${response}
+                Response: ${response.content}
+                Request: POST ${url}: [${body}]
+                """.stripIndent().trim(),
+            ]
+            // 5XX are internal server errors, we'll assume we can sleep and retry.
+            // 429 is "Too Many Requests" which is meant to be a retry.
+            if (code >= 500 || code == 429) {
+                error(errorArg)
+            } else {
+                // Other 4XX errors indicate a bad request that should not be retried.
+                retryWithBackoff.errorNoRetry(errorArg)
+            }
+        }
+    }
+    def json = new JsonSlurperClassic().parseText(response.content)
+    return json
+}
+
+def PATCH(String url, Map map) {
+    def body = JsonOutput.toJson(map)
+    def response = httpRequest([
+        acceptType: 'APPLICATION_JSON',
+        contentType: 'APPLICATION_JSON',
+        authentication: token(),
+        httpMode: 'PATCH',
+        url: urlAPI()+url,
+        requestBody: body,
+        validResponseCodes: '100:600',
+    ])
+    def code = response.getStatus()
+    def json = new JsonSlurperClassic().parseText(response.content)
+    return json
+}
+
+def DELETE(String url) {
+    def response = httpRequest([
+        authentication: token(),
+        httpMode: 'DELETE',
+        url: urlAPI()+url,
+        validResponseCodes: '100:600',
+    ])
+    def code = response.getStatus()
+    return code
+}
+
+def getAllOpenPullRequests(String repo, String org) {
+    def url = "repos/${check(org)}/${check(repo)}/pulls?state=opened"
+    return GET('PullRequest', url)
+}
+
+def postCommentToNamedPR(String comment, String number, String repo, String org) {
+    def url = "repos/${check(org)}/${check(repo)}/issues/${checkNumber(number)}/comments"
+    return POST('AddComment', url, [body: comment])
+}
+
+def patchClosePullRequest(String number, String repo, String org) {
+    def url = "repos/${check(org)}/${check(repo)}/pulls/${checkNumber(number)}"
+    return PATCH(url, [state: 'closed'])
+}
+
+def getCommitAuthor(String commit_sha, String repo, String org) {
+    def url = "repos/${check(org)}/${check(repo)}/commits/${commit_sha}"
+    def json = GET('Users', url)
+    if (json == null || json == "")  {
+        return null
+    }
+    return json.commit.author.email
+}
+
+def getAllBranches(String pageNumber, String repo, String org) {
+    def url = "repos/${check(org)}/${check(repo)}/branches?per_page=100&page=${checkNumber(pageNumber)}"
+    return GET('Branch', url)
+}
+
+def getCommit(String commit, String repo, String org) {
+    def url = "repos/${check(org)}/${check(repo)}/commits/${checkBranch(commit)}"
+    return GET('Commit', url)
+}
+
+def deleteBranch(String branch, String repo, String org) {
+    def branchRef = branch
+    if (!branchRef.startsWith('heads/')) {
+        branchRef = 'heads/' + branchRef
+    }
+    def url = "repos/${check(org)}/${check(repo)}/git/refs/${branchRef}"
+    if (branch.startsWith('master') ||
+        branch.startsWith('integration') ||
+        branch.startsWith('release')) {
+        error "Trying to delete a restricted branch: '${branch}'"
+    }
+    return DELETE(url)
+}
+
+//////////////////////////
 
 // If the email used for GitHub commits differs from the one used in
 // Slack, the mismatch can be resolved with an entry here so Slack
@@ -171,7 +350,7 @@ stage('Scan Repository') {
         try {
             // Check all open PR's to see if they are stale
             // API URL: GET /api/v3/repos/:org/:repo/pulls?state=opened
-            def openPRs = spgithub.getAllOpenPullRequests(repository, org)
+            def openPRs = getAllOpenPullRequests(repository, org)
             openPRs.each {
                 // For determining when a PR's content is considered stale, we have three dates
                 // as points of reference:
@@ -193,17 +372,17 @@ stage('Scan Repository') {
                     // API URL: POST /api/v3/repos/:org/:repo/issues/:number/comments
                     // Payload sent: [body: 'MESSAGE']
                     def comment = "This PR was closed by the GitClean bot due to inactivity. See the [GitClean README](https://github.com/KyleLavorato/gitclean-jenkins/blob/master/README.md) for more details."
-                    spgithub.postCommentToNamedPR(comment, prNum, repository, org)
+                    postCommentToNamedPR(comment, prNum, repository, org)
                     // API URL: PATCH /api/v3/repos/:org/:repo/pulls/:number
                     // Payload sent: [state: 'closed']
-                    spgithub.patchClosePullRequest(prNum, repository, org)
+                    patchClosePullRequest(prNum, repository, org)
                 } else if (prWarn) {
                     state = "warn"
                     slackMsg = "<${it.html_url}|${it.title}> is over ${daysForPrWarn} days old and will be closed on `${prDate.plus(daysForPrClose)}` if not updated\n"
                 }
                 if (state != "") {
                     // API URL: GET /api/v3/repos/:org/:repo/commits/:commit_sha
-                    def author = spgithub.getCommitAuthor(it.merge_commit_sha.toString(), repository, org)
+                    def author = getCommitAuthor(it.merge_commit_sha.toString(), repository, org)
                     author = slackEmailAlias.containsKey(author) ? slackEmailAlias[author] : author
                     def slackUser = slackUserIdFromEmail([email: author, botUser: true, tokenCredentialId: 'jenkinsbot-token'])
                     if (botUsers.contains(author) || slackUser == null) {
@@ -231,7 +410,7 @@ stage('Scan Repository') {
             def pageNumber = 1
             while (true) {
                 // API URL: GET /api/v3/repos/:org/:repo/branches?per_page=100&page={pageNumber}
-                def branchQuery = spgithub.getAllBranches(pageNumber.toString(), repository, org)
+                def branchQuery = getAllBranches(pageNumber.toString(), repository, org)
                 if (branchQuery.isEmpty()) break
                 allBranchesJson.add(branchQuery)
                 pageNumber += 1
@@ -252,7 +431,7 @@ stage('Scan Repository') {
             // check the last commit in the branch for the date
             allBranches.each { branch, sha ->
                 // API URL: GET /api/v3/repos/:org/:repo/commits/:commit
-                def commit = spgithub.getCommit(sha, repository, org)
+                def commit = getCommit(sha, repository, org)
                 // By checking the committer instead of author, we get the most recent person
                 // to modify the branch. This lets us know if it has been edited since a bot
                 // originally made a branch.
@@ -268,7 +447,7 @@ stage('Scan Repository') {
                         botBranch = false
                     }
                 }
-                def html_url = "https://spgithub.trendmicro.com/deep-security/${repository}/tree/${branch}"
+                def html_url = "https://github.com/${repository}/tree/${branch}"
                 def slackMsg = ""
                 def slackUser = slackUserIdFromEmail([email: author, botUser: true, tokenCredentialId: 'jenkinsbot-token'])
                 if (botUsers.contains(author) || slackUser == null) {
@@ -280,7 +459,7 @@ stage('Scan Repository') {
                         slackMsg = "`${branch}` is over ${daysForBotBranchDelete} days old and has been deleted\n"
                         branchLogs += """#${slackUser}-Branch: [state:"delete", title:"${branch}", dateCreated:"${formatBranchDate}", age:"${currentDate - branchDate}", author:"${author}"]\n"""
                         // API URL: DELETE /api/v3/repos/:org/:repo/git/refs/heads/:branch
-                        spgithub.deleteBranch(branch, repository, org)
+                        deleteBranch(branch, repository, org)
                     } else if (daysForBotBranchDelete != 0 && sameDayFmt.format(warnBotBranchDateFinal).equals(sameDayFmt.format(branchDate)) || sameDayFmt.format(warnBotBranchDate).equals(sameDayFmt.format(branchDate))) {
                         slackMsg = "`${branch}` is ${currentDate - branchDate} days old and will be deleted on `${branchDate.plus(daysForBotBranchDelete)}` if not updated\n"
                         branchLogs += """#${slackUser}-Branch: [state:"warn", title:"${branch}", dateCreated:"${formatBranchDate}", age:"${currentDate - branchDate}", dateToDelete: "${branchDate.plus(daysForBotBranchDelete)}", author:"${author}"]\n"""
